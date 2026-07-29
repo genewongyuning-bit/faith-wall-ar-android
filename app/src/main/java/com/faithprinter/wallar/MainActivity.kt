@@ -54,9 +54,12 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.ar.core.Anchor
+import com.google.ar.core.Config
+import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
+import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
@@ -65,6 +68,7 @@ import io.github.sceneview.math.Size
 import io.github.sceneview.node.ImageNode
 import io.github.sceneview.rememberEngine
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlin.math.round
 import kotlin.math.sqrt
 
@@ -105,6 +109,9 @@ private fun FaithWallAR() {
     var locked by remember { mutableStateOf(false) }
     var cornerPoses by remember { mutableStateOf<List<Pose>>(emptyList()) }
     var selectedWall by remember { mutableStateOf<Plane?>(null) }
+    var selectionUsesDepth by remember { mutableStateOf(false) }
+    var depthSupported by remember { mutableStateOf(false) }
+    var depthReady by remember { mutableStateOf(false) }
     var surfaceMode by remember { mutableStateOf(SurfaceMode.WALL) }
     var language by remember { mutableStateOf(AppLanguage.ZH) }
     var unitSystem by remember { mutableStateOf(UnitSystem.METRIC) }
@@ -113,7 +120,9 @@ private fun FaithWallAR() {
     var measuredHeight by remember { mutableFloatStateOf(0f) }
     var overlayPoints by remember { mutableStateOf<List<Offset>>(emptyList()) }
     val latestFrame = remember { AtomicReference<Frame?>(null) }
+    val latestSession = remember { AtomicReference<Session?>(null) }
     val latestVerticalWall = remember { AtomicReference<Plane?>(null) }
+    val recentDepthPoses = remember { ArrayDeque<Pose>() }
     val engine = rememberEngine()
 
     fun resetWallSelection(message: String) {
@@ -122,6 +131,9 @@ private fun FaithWallAR() {
         locked = false
         cornerPoses = emptyList()
         selectedWall = null
+        selectionUsesDepth = false
+        recentDepthPoses.clear()
+        depthReady = false
         measuredWidth = 0f
         measuredHeight = 0f
         overlayPoints = emptyList()
@@ -159,18 +171,56 @@ private fun FaithWallAR() {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
             engine = engine,
+            depthMode = Config.DepthMode.AUTOMATIC,
             planeRenderer = !locked,
+            onSessionCreated = { session ->
+                latestSession.set(session)
+                depthSupported =
+                    session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
+            },
             onSessionUpdated = { session, frame ->
+                latestSession.set(session)
                 latestFrame.set(frame)
                 val detectedWall = session.getAllTrackables(Plane::class.java).firstOrNull {
                     planeMatchesMode(it, surfaceMode) &&
                         it.trackingState == TrackingState.TRACKING
                 }
                 latestVerticalWall.set(detectedWall)
-                overlayPoints = cornerPoses.mapNotNull {
+                val centerDepthPose = if (
+                    depthSupported &&
+                    viewport != IntSize.Zero &&
+                    anchor == null
+                ) {
+                    frame.hitTest(viewport.width / 2f, viewport.height / 2f)
+                        .firstOrNull {
+                            it.trackable is DepthPoint &&
+                                poseMatchesMode(it.hitPose, surfaceMode)
+                        }
+                        ?.hitPose
+                } else {
+                    null
+                }
+                if (centerDepthPose != null) {
+                    recentDepthPoses.addLast(centerDepthPose)
+                    while (recentDepthPoses.size > 8) recentDepthPoses.removeFirst()
+                } else {
+                    recentDepthPoses.clear()
+                }
+                val stableNow = depthSamplesStable(recentDepthPoses)
+                if (stableNow != depthReady) depthReady = stableNow
+                val currentBitmap = bitmap
+                val currentAnchor = anchor
+                val boundaryPoses = if (currentBitmap != null && currentAnchor != null) {
+                    val imageHeight =
+                        widthMeters * currentBitmap.height / currentBitmap.width.toFloat()
+                    imageBoundaryPoses(currentAnchor.pose, widthMeters, imageHeight)
+                } else {
+                    cornerPoses
+                }
+                overlayPoints = boundaryPoses.mapNotNull {
                     projectPoseToScreen(it, frame, viewport)
                 }
-                val found = detectedWall != null
+                val found = detectedWall != null || depthReady
                 if (found != wallVisible) wallVisible = found
                 if (found && anchor == null && cornerPoses.isEmpty()) {
                     trackingMessage = tr(
@@ -218,7 +268,7 @@ private fun FaithWallAR() {
 
         MeasurementOverlay(
             points = overlayPoints,
-            closed = cornerPoses.size == 4,
+            closed = anchor != null || cornerPoses.size == 4,
             modifier = Modifier.fillMaxSize()
         )
 
@@ -238,13 +288,21 @@ private fun FaithWallAR() {
             status = if (bitmap == null && cornerPoses.isEmpty()) {
                 tr(
                     language,
-                    "可以先确认四角，也可以先导入图片",
-                    "Measure four corners or choose an image first"
+                    if (depthSupported) {
+                        "深度增强模式 · 可以先确认四角或导入图片"
+                    } else {
+                        "兼容模式 · 可以先确认四角或导入图片"
+                    },
+                    if (depthSupported) {
+                        "Depth enhanced · Measure corners or choose an image"
+                    } else {
+                        "Compatibility mode · Measure corners or choose an image"
+                    }
                 )
             } else {
                 trackingMessage
             },
-            canConfirmCorner = true,
+            canConfirmCorner = depthReady || wallVisible,
             confirmedCorners = cornerPoses.size,
             placed = anchor != null,
             locked = locked,
@@ -298,6 +356,23 @@ private fun FaithWallAR() {
                         viewport.height / 2f
                     )
                     val lockedPlane = selectedWall
+                    val firstSurfacePose = cornerPoses.firstOrNull()
+                    val exactDepthHit = if (
+                        depthSupported &&
+                        depthReady &&
+                        (firstSurfacePose == null || selectionUsesDepth)
+                    ) {
+                        hits.firstOrNull { result ->
+                            result.trackable is DepthPoint &&
+                                poseMatchesMode(result.hitPose, surfaceMode) &&
+                                (
+                                    firstSurfacePose == null ||
+                                        poseBelongsToSurface(result.hitPose, firstSurfacePose)
+                                    )
+                        }
+                    } else {
+                        null
+                    }
                     val exactPlaneHit = hits.firstOrNull { result ->
                         val plane = result.trackable as? Plane
                         plane != null &&
@@ -305,32 +380,55 @@ private fun FaithWallAR() {
                             plane.trackingState == TrackingState.TRACKING &&
                             (lockedPlane == null || plane === lockedPlane)
                     }
-                    if (exactPlaneHit == null && lockedPlane == null) {
+                    val chosenHit = when {
+                        firstSurfacePose == null -> exactDepthHit ?: exactPlaneHit
+                        selectionUsesDepth -> exactDepthHit
+                        else -> exactPlaneHit
+                    }
+
+                    if (chosenHit == null && firstSurfacePose == null) {
                         trackingMessage = tr(
                             language,
-                            "尚未识别${surfaceModeLabel(surfaceMode, language)}，请缓慢移动设备后再次点击",
-                            "No ${surfaceModeLabel(surfaceMode, language).lowercase()} detected. Move slowly and try again"
+                            if (depthSupported) {
+                                "深度尚未稳定，请缓慢移动设备扫描${surfaceModeLabel(surfaceMode, language)}"
+                            } else {
+                                "尚未识别${surfaceModeLabel(surfaceMode, language)}，请继续缓慢扫描"
+                            },
+                            if (depthSupported) {
+                                "Depth is not stable. Slowly scan the ${surfaceModeLabel(surfaceMode, language).lowercase()}"
+                            } else {
+                                "No ${surfaceModeLabel(surfaceMode, language).lowercase()} detected. Keep scanning slowly"
+                            }
                         )
-                    } else if (exactPlaneHit == null) {
+                    } else if (chosenHit == null) {
                         trackingMessage = tr(
                             language,
-                            "请把准星移回第一次确认的同一${surfaceModeLabel(surfaceMode, language)}",
-                            "Aim at the same ${surfaceModeLabel(surfaceMode, language).lowercase()} as the first point"
+                            "当前点与第一个点不在同一平面，请重新瞄准",
+                            "This point is not on the first surface. Aim again"
                         )
                     } else {
-                        val plane = exactPlaneHit.trackable as Plane
-                        if (selectedWall == null) selectedWall = plane
-                        val cornerOnWall = projectPoseToPlane(exactPlaneHit.hitPose, plane)
+                        val hitPlane = chosenHit.trackable as? Plane
+                        if (cornerPoses.isEmpty()) {
+                            selectionUsesDepth = chosenHit.trackable is DepthPoint
+                            selectedWall = hitPlane
+                        }
+                        val cornerOnWall = if (hitPlane != null) {
+                            projectPoseToPlane(chosenHit.hitPose, hitPlane)
+                        } else {
+                            chosenHit.hitPose
+                        }
                         val updatedCorners = cornerPoses + cornerOnWall
                         cornerPoses = updatedCorners
 
                         if (updatedCorners.size == 4) {
                             val centerPose = wallCenterPose(updatedCorners)
-                            val dimensions = measuredDimensions(updatedCorners)
+                            val fittedCorners = snapCornersToPlane(updatedCorners, centerPose)
+                            cornerPoses = fittedCorners
+                            val dimensions = measuredDimensions(fittedCorners)
                             measuredWidth = dimensions.first
                             measuredHeight = dimensions.second
                             anchor?.detach()
-                            anchor = plane.createAnchor(centerPose)
+                            anchor = latestSession.get()?.createAnchor(centerPose)
                             locked = true
                             trackingMessage = tr(
                                 language,
@@ -771,6 +869,78 @@ private fun projectPoseToPlane(sourcePose: Pose, plane: Plane): Pose {
     localPoint[1] = 0f
     val pointOnWall = planePose.transformPoint(localPoint)
     return Pose(pointOnWall, planePose.rotationQuaternion)
+}
+
+private fun snapCornersToPlane(corners: List<Pose>, fittedPlanePose: Pose): List<Pose> =
+    corners.map { corner ->
+        val local = fittedPlanePose.inverse().transformPoint(
+            floatArrayOf(corner.tx(), corner.ty(), corner.tz())
+        )
+        local[1] = 0f
+        val snapped = fittedPlanePose.transformPoint(local)
+        Pose(snapped, fittedPlanePose.rotationQuaternion)
+    }
+
+private fun imageBoundaryPoses(
+    centerPose: Pose,
+    widthMeters: Float,
+    heightMeters: Float
+): List<Pose> {
+    val halfWidth = widthMeters / 2f
+    val halfHeight = heightMeters / 2f
+    return listOf(
+        floatArrayOf(-halfWidth, 0f, -halfHeight),
+        floatArrayOf(halfWidth, 0f, -halfHeight),
+        floatArrayOf(halfWidth, 0f, halfHeight),
+        floatArrayOf(-halfWidth, 0f, halfHeight)
+    ).map { localPoint ->
+        Pose(
+            centerPose.transformPoint(localPoint),
+            centerPose.rotationQuaternion
+        )
+    }
+}
+
+private fun poseMatchesMode(pose: Pose, mode: SurfaceMode): Boolean {
+    val normal = normalize(pose.rotateVector(floatArrayOf(0f, 1f, 0f)))
+    return when (mode) {
+        SurfaceMode.WALL -> abs(normal[1]) < 0.45f
+        SurfaceMode.FLOOR -> abs(normal[1]) > 0.72f
+    }
+}
+
+private fun poseBelongsToSurface(candidate: Pose, reference: Pose): Boolean {
+    val referenceNormal = normalize(reference.rotateVector(floatArrayOf(0f, 1f, 0f)))
+    val candidateNormal = normalize(candidate.rotateVector(floatArrayOf(0f, 1f, 0f)))
+    val normalAgreement = abs(dot(referenceNormal, candidateNormal))
+    val delta = floatArrayOf(
+        candidate.tx() - reference.tx(),
+        candidate.ty() - reference.ty(),
+        candidate.tz() - reference.tz()
+    )
+    val distanceFromPlane = abs(dot(delta, referenceNormal))
+    return normalAgreement > 0.90f && distanceFromPlane < 0.06f
+}
+
+private fun depthSamplesStable(samples: Collection<Pose>): Boolean {
+    if (samples.size < 5) return false
+    val center = Pose.makeTranslation(
+        samples.map { it.tx() }.average().toFloat(),
+        samples.map { it.ty() }.average().toFloat(),
+        samples.map { it.tz() }.average().toFloat()
+    )
+    val maxPositionJitter = samples.maxOf { poseDistance(it, center) }
+    val referenceNormal =
+        normalize(samples.first().rotateVector(floatArrayOf(0f, 1f, 0f)))
+    val lowestNormalAgreement = samples.minOf {
+        abs(
+            dot(
+                referenceNormal,
+                normalize(it.rotateVector(floatArrayOf(0f, 1f, 0f)))
+            )
+        )
+    }
+    return maxPositionJitter < 0.035f && lowestNormalAgreement > 0.90f
 }
 
 private fun projectPoseToScreen(
