@@ -183,12 +183,7 @@ private fun FaithWallAR() {
                     val hit = frame.hitTest(
                         viewport.width / 2f,
                         viewport.height / 2f
-                    ).firstOrNull { result ->
-                        val plane = result.trackable as? Plane
-                        plane?.type == Plane.Type.VERTICAL &&
-                            plane.trackingState == TrackingState.TRACKING &&
-                            plane.isPoseInPolygon(result.hitPose)
-                    }
+).firstOrNull()
                     if (hit != null) {
                         anchor?.detach()
                         anchor = hit.createAnchor()
