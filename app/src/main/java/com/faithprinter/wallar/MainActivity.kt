@@ -297,32 +297,30 @@ private fun FaithWallAR() {
                         viewport.width / 2f,
                         viewport.height / 2f
                     )
-                    val verticalPlaneHit = hits.firstOrNull { result ->
+                    val lockedPlane = selectedWall
+                    val exactPlaneHit = hits.firstOrNull { result ->
                         val plane = result.trackable as? Plane
                         plane != null &&
                             planeMatchesMode(plane, surfaceMode) &&
-                            plane.trackingState == TrackingState.TRACKING
+                            plane.trackingState == TrackingState.TRACKING &&
+                            (lockedPlane == null || plane === lockedPlane)
                     }
-                    val plane = selectedWall
-                        ?: (verticalPlaneHit?.trackable as? Plane)
-                        ?: latestVerticalWall.get()
-                    val positionHit = verticalPlaneHit ?: hits.firstOrNull()
-
-                    if (plane == null) {
+                    if (exactPlaneHit == null && lockedPlane == null) {
                         trackingMessage = tr(
                             language,
                             "尚未识别${surfaceModeLabel(surfaceMode, language)}，请缓慢移动设备后再次点击",
                             "No ${surfaceModeLabel(surfaceMode, language).lowercase()} detected. Move slowly and try again"
                         )
-                    } else if (positionHit == null) {
+                    } else if (exactPlaneHit == null) {
                         trackingMessage = tr(
                             language,
-                            "这个位置暂时没有深度信息，请稍微移动设备后再次点击",
-                            "No depth data here. Move slightly and try again"
+                            "请把准星移回第一次确认的同一${surfaceModeLabel(surfaceMode, language)}",
+                            "Aim at the same ${surfaceModeLabel(surfaceMode, language).lowercase()} as the first point"
                         )
                     } else {
+                        val plane = exactPlaneHit.trackable as Plane
                         if (selectedWall == null) selectedWall = plane
-                        val cornerOnWall = projectPoseToPlane(positionHit.hitPose, plane)
+                        val cornerOnWall = projectPoseToPlane(exactPlaneHit.hitPose, plane)
                         val updatedCorners = cornerPoses + cornerOnWall
                         cornerPoses = updatedCorners
 
@@ -692,8 +690,13 @@ private fun wallCenterPose(corners: List<Pose>): Pose {
             corners[3].tz() - corners[0].tz()
         )
     )
-    val yAxis = normalize(cross(roughZ, xAxis))
-    val zAxis = normalize(cross(xAxis, yAxis))
+    var yAxis = normalize(cross(roughZ, xAxis))
+    var zAxis = normalize(cross(xAxis, yAxis))
+    val planeNormal = corners.first().rotateVector(floatArrayOf(0f, 1f, 0f))
+    if (dot(yAxis, planeNormal) < 0f) {
+        yAxis = floatArrayOf(-yAxis[0], -yAxis[1], -yAxis[2])
+        zAxis = floatArrayOf(-zAxis[0], -zAxis[1], -zAxis[2])
+    }
     return Pose(translation, quaternionFromAxes(xAxis, yAxis, zAxis))
 }
 
@@ -712,6 +715,9 @@ private fun cross(a: FloatArray, b: FloatArray): FloatArray = floatArrayOf(
     a[2] * b[0] - a[0] * b[2],
     a[0] * b[1] - a[1] * b[0]
 )
+
+private fun dot(a: FloatArray, b: FloatArray): Float =
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 private fun quaternionFromAxes(
     x: FloatArray,
