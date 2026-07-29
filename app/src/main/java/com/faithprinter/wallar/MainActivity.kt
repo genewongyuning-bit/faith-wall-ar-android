@@ -10,17 +10,15 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -53,6 +51,7 @@ import androidx.compose.ui.unit.sp
 import com.google.ar.core.Anchor
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
+import com.google.ar.core.Pose
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
@@ -91,17 +90,26 @@ private fun FaithWallAR() {
     var trackingMessage by remember { mutableStateOf("移动设备，缓慢扫描墙面") }
     var viewport by remember { mutableStateOf(IntSize.Zero) }
     var locked by remember { mutableStateOf(false) }
+    var cornerPoses by remember { mutableStateOf<List<Pose>>(emptyList()) }
+    var selectedWall by remember { mutableStateOf<Plane?>(null) }
     val latestFrame = remember { AtomicReference<Frame?>(null) }
     val engine = rememberEngine()
+
+    fun resetWallSelection(message: String) {
+        anchor?.detach()
+        anchor = null
+        locked = false
+        cornerPoses = emptyList()
+        selectedWall = null
+        trackingMessage = message
+    }
 
     val imagePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         decodeBitmap(context, uri)?.let {
-            anchor?.detach()
-            anchor = null
-            locked = false
+            resetWallSelection("图片已导入，请确认墙面的四个角")
             bitmap = it
         }
     }
@@ -129,10 +137,12 @@ private fun FaithWallAR() {
                     it.type == Plane.Type.VERTICAL && it.trackingState == TrackingState.TRACKING
                 }
                 if (found != wallVisible) wallVisible = found
-                if (found && anchor == null) trackingMessage = "墙面已识别，将准星对准目标位置"
+                if (found && anchor == null && cornerPoses.isEmpty()) {
+                    trackingMessage = "墙面已识别，请把准星对准左上角"
+                }
             },
             onTrackingFailureChanged = { reason ->
-                trackingMessage = trackingHint(reason)
+                if (cornerPoses.isEmpty()) trackingMessage = trackingHint(reason)
             },
             onSessionFailed = {
                 trackingMessage = "无法启动 AR：请确认设备支持 Google Play AR 服务"
@@ -164,6 +174,7 @@ private fun FaithWallAR() {
         if (anchor == null) {
             Reticle(
                 active = wallVisible,
+                cornerNumber = cornerPoses.size + 1,
                 modifier = Modifier.align(Alignment.Center)
             )
         }
@@ -172,33 +183,53 @@ private fun FaithWallAR() {
             bitmap = bitmap,
             widthMeters = widthMeters,
             status = if (bitmap == null) "请先导入需要打印的图片" else trackingMessage,
-            canPlace = bitmap != null && wallVisible,
+            canConfirmCorner = bitmap != null && wallVisible,
+            confirmedCorners = cornerPoses.size,
             placed = anchor != null,
             locked = locked,
             onImport = { imagePicker.launch("image/*") },
             onWidthChange = { widthMeters = it.coerceIn(0.2f, 10f) },
-            onPlace = {
+            onConfirmCorner = {
                 val frame = latestFrame.get()
                 if (frame != null && viewport != IntSize.Zero) {
                     val hit = frame.hitTest(
                         viewport.width / 2f,
                         viewport.height / 2f
-).firstOrNull()
-                    if (hit != null) {
-                        anchor?.detach()
-                        anchor = hit.createAnchor()
-                        locked = true
-                        trackingMessage = "已按真实尺寸固定在墙面"
+                    ).firstOrNull { result ->
+                        val plane = result.trackable as? Plane
+                        plane != null &&
+                            plane.type == Plane.Type.VERTICAL &&
+                            plane.trackingState == TrackingState.TRACKING &&
+                            plane.isPoseInPolygon(result.hitPose) &&
+                            (selectedWall == null || plane == selectedWall)
+                    }
+
+                    val plane = hit?.trackable as? Plane
+                    if (hit == null || plane == null) {
+                        trackingMessage = if (selectedWall == null) {
+                            "准星没有对准墙面，请稍微移动设备后重试"
+                        } else {
+                            "请继续在同一面墙上确认下一个角"
+                        }
                     } else {
-                        trackingMessage = "准星没有对准已识别的墙面，请稍微移动设备"
+                        if (selectedWall == null) selectedWall = plane
+                        val updatedCorners = cornerPoses + hit.hitPose
+                        cornerPoses = updatedCorners
+
+                        if (updatedCorners.size == 4) {
+                            val centerPose = wallCenterPose(updatedCorners)
+                            anchor?.detach()
+                            anchor = plane.createAnchor(centerPose)
+                            locked = true
+                            trackingMessage = "四角已确认，图片已锁定在这面墙上"
+                        } else {
+                            trackingMessage = cornerInstruction(updatedCorners.size)
+                        }
                     }
                 }
             },
             onReposition = {
-                anchor?.detach()
-                anchor = null
-                locked = false
-                trackingMessage = "重新将准星对准墙面"
+                resetWallSelection("请重新确认墙面的左上角")
             },
             onLockToggle = { locked = !locked },
             modifier = Modifier
@@ -214,13 +245,13 @@ private fun BrandHeader(modifier: Modifier = Modifier) {
         modifier = modifier
             .background(Panel, RoundedCornerShape(18.dp))
             .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
-            .padding(horizontal = 14.dp, vertical = 9.dp),
+            .padding(horizontal = 14.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Image(
             painter = painterResource(R.drawable.faith_printer_logo),
             contentDescription = "FAITH PRINTER",
-            modifier = Modifier.size(width = 150.dp, height = 48.dp),
+            modifier = Modifier.size(width = 210.dp, height = 94.dp),
             contentScale = ContentScale.Fit
         )
         Text("WALL AR · TRUE SIZE", color = Muted, fontSize = 9.sp, letterSpacing = 2.sp)
@@ -228,17 +259,22 @@ private fun BrandHeader(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun Reticle(active: Boolean, modifier: Modifier = Modifier) {
+private fun Reticle(
+    active: Boolean,
+    cornerNumber: Int,
+    modifier: Modifier = Modifier
+) {
     Box(
         modifier = modifier
-            .size(54.dp)
+            .size(58.dp)
             .border(2.dp, if (active) Blue else Color.White.copy(alpha = .55f), CircleShape),
         contentAlignment = Alignment.Center
     ) {
-        Box(
-            Modifier
-                .size(7.dp)
-                .background(if (active) Blue else Color.White, CircleShape)
+        Text(
+            text = cornerNumber.coerceAtMost(4).toString(),
+            color = if (active) Blue else Color.White,
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp
         )
     }
 }
@@ -248,12 +284,13 @@ private fun Controls(
     bitmap: Bitmap?,
     widthMeters: Float,
     status: String,
-    canPlace: Boolean,
+    canConfirmCorner: Boolean,
+    confirmedCorners: Int,
     placed: Boolean,
     locked: Boolean,
     onImport: () -> Unit,
     onWidthChange: (Float) -> Unit,
-    onPlace: () -> Unit,
+    onConfirmCorner: () -> Unit,
     onReposition: () -> Unit,
     onLockToggle: () -> Unit,
     modifier: Modifier = Modifier
@@ -268,6 +305,10 @@ private fun Controls(
         verticalArrangement = Arrangement.spacedBy(11.dp)
     ) {
         Text(status, color = Color.White, fontSize = 13.sp)
+
+        if (bitmap != null && !placed) {
+            CornerProgress(confirmedCorners)
+        }
 
         if (bitmap != null) {
             Row(
@@ -303,12 +344,12 @@ private fun Controls(
 
             if (!placed) {
                 Button(
-                    onClick = onPlace,
-                    enabled = canPlace,
+                    onClick = onConfirmCorner,
+                    enabled = canConfirmCorner,
                     modifier = Modifier.weight(1.25f),
                     colors = ButtonDefaults.buttonColors(containerColor = Blue)
                 ) {
-                    Text("放到墙上")
+                    Text(cornerButtonLabel(confirmedCorners))
                 }
             } else {
                 Button(
@@ -325,7 +366,7 @@ private fun Controls(
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
                 ) {
-                    Text("重放")
+                    Text("重选四角")
                 }
             }
         }
@@ -342,6 +383,39 @@ private fun Controls(
 }
 
 @Composable
+private fun CornerProgress(confirmedCorners: Int) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        listOf("左上", "右上", "右下", "左下").forEachIndexed { index, label ->
+            Column(
+                modifier = Modifier.padding(horizontal = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(
+                            if (index < confirmedCorners) Blue else Color(0xFF343C49),
+                            CircleShape
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (index < confirmedCorners) "✓" else "${index + 1}",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Text(label, color = Muted, fontSize = 9.sp)
+            }
+        }
+    }
+}
+
+@Composable
 private fun SmallButton(label: String, onClick: () -> Unit) {
     OutlinedButton(
         onClick = onClick,
@@ -351,6 +425,30 @@ private fun SmallButton(label: String, onClick: () -> Unit) {
     ) {
         Text(label, fontSize = 19.sp)
     }
+}
+
+private fun wallCenterPose(corners: List<Pose>): Pose {
+    val translation = floatArrayOf(
+        corners.map { it.tx() }.average().toFloat(),
+        corners.map { it.ty() }.average().toFloat(),
+        corners.map { it.tz() }.average().toFloat()
+    )
+    return Pose(translation, corners.first().rotationQuaternion)
+}
+
+private fun cornerInstruction(confirmedCount: Int): String = when (confirmedCount) {
+    1 -> "左上角已确认，请对准右上角"
+    2 -> "右上角已确认，请对准右下角"
+    3 -> "右下角已确认，请对准左下角"
+    else -> "请确认墙面的四个角"
+}
+
+private fun cornerButtonLabel(confirmedCount: Int): String = when (confirmedCount) {
+    0 -> "确认左上角"
+    1 -> "确认右上角"
+    2 -> "确认右下角"
+    3 -> "确认左下角"
+    else -> "四角已确认"
 }
 
 private fun decodeBitmap(context: android.content.Context, uri: Uri): Bitmap? =
