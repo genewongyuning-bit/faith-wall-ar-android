@@ -67,6 +67,12 @@ private val Panel = Color(0xE9141820)
 private val Blue = Color(0xFF157AF6)
 private val Muted = Color(0xFF9AA7B8)
 
+private enum class SurfaceMode(val label: String) {
+    WALL("墙面"),
+    FLOOR("地面"),
+    FLEXIBLE("卷帘门/集装箱")
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -92,6 +98,7 @@ private fun FaithWallAR() {
     var locked by remember { mutableStateOf(false) }
     var cornerPoses by remember { mutableStateOf<List<Pose>>(emptyList()) }
     var selectedWall by remember { mutableStateOf<Plane?>(null) }
+    var surfaceMode by remember { mutableStateOf(SurfaceMode.WALL) }
     val latestFrame = remember { AtomicReference<Frame?>(null) }
     val latestVerticalWall = remember { AtomicReference<Plane?>(null) }
     val engine = rememberEngine()
@@ -110,8 +117,13 @@ private fun FaithWallAR() {
     ) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         decodeBitmap(context, uri)?.let {
-            resetWallSelection("图片已导入，请确认墙面的四个角")
+            bitmap?.recycle()
             bitmap = it
+            trackingMessage = if (anchor != null) {
+                "图片已导入，并已固定在确认区域"
+            } else {
+                "图片已导入，现在可以确认四个角"
+            }
         }
     }
 
@@ -135,13 +147,14 @@ private fun FaithWallAR() {
             onSessionUpdated = { session, frame ->
                 latestFrame.set(frame)
                 val detectedWall = session.getAllTrackables(Plane::class.java).firstOrNull {
-                    it.type == Plane.Type.VERTICAL && it.trackingState == TrackingState.TRACKING
+                    planeMatchesMode(it, surfaceMode) &&
+                        it.trackingState == TrackingState.TRACKING
                 }
                 latestVerticalWall.set(detectedWall)
                 val found = detectedWall != null
                 if (found != wallVisible) wallVisible = found
                 if (found && anchor == null && cornerPoses.isEmpty()) {
-                    trackingMessage = "墙面已识别，请把准星对准左上角"
+                    trackingMessage = "${surfaceMode.label}已识别，请把准星对准左上角"
                 }
             },
             onTrackingFailureChanged = { reason ->
@@ -185,12 +198,23 @@ private fun FaithWallAR() {
         Controls(
             bitmap = bitmap,
             widthMeters = widthMeters,
-            status = if (bitmap == null) "请先导入需要打印的图片" else trackingMessage,
-            canConfirmCorner = bitmap != null,
+            status = if (bitmap == null && cornerPoses.isEmpty()) {
+                "可以先确认四角，也可以先导入图片"
+            } else {
+                trackingMessage
+            },
+            canConfirmCorner = true,
             confirmedCorners = cornerPoses.size,
             placed = anchor != null,
             locked = locked,
+            surfaceMode = surfaceMode,
             onImport = { imagePicker.launch("image/*") },
+            onSurfaceModeChange = { mode ->
+                if (mode != surfaceMode) {
+                    surfaceMode = mode
+                    resetWallSelection("已切换到${mode.label}模式，请确认左上角")
+                }
+            },
             onWidthChange = { widthMeters = it.coerceIn(0.2f, 10f) },
             onConfirmCorner = {
                 val frame = latestFrame.get()
@@ -202,7 +226,7 @@ private fun FaithWallAR() {
                     val verticalPlaneHit = hits.firstOrNull { result ->
                         val plane = result.trackable as? Plane
                         plane != null &&
-                            plane.type == Plane.Type.VERTICAL &&
+                            planeMatchesMode(plane, surfaceMode) &&
                             plane.trackingState == TrackingState.TRACKING
                     }
                     val plane = selectedWall
@@ -211,7 +235,7 @@ private fun FaithWallAR() {
                     val positionHit = verticalPlaneHit ?: hits.firstOrNull()
 
                     if (plane == null) {
-                        trackingMessage = "尚未识别墙面，请缓慢左右移动设备后再次点击"
+                        trackingMessage = "尚未识别${surfaceMode.label}，请缓慢移动设备后再次点击"
                     } else if (positionHit == null) {
                         trackingMessage = "这个位置暂时没有深度信息，请稍微移动设备后再次点击"
                     } else {
@@ -292,7 +316,9 @@ private fun Controls(
     confirmedCorners: Int,
     placed: Boolean,
     locked: Boolean,
+    surfaceMode: SurfaceMode,
     onImport: () -> Unit,
+    onSurfaceModeChange: (SurfaceMode) -> Unit,
     onWidthChange: (Float) -> Unit,
     onConfirmCorner: () -> Unit,
     onReposition: () -> Unit,
@@ -310,7 +336,9 @@ private fun Controls(
     ) {
         Text(status, color = Color.White, fontSize = 13.sp)
 
-        if (bitmap != null && !placed) {
+        SurfaceModeSelector(surfaceMode, onSurfaceModeChange)
+
+        if (!placed) {
             CornerProgress(confirmedCorners)
         }
 
@@ -387,6 +415,33 @@ private fun Controls(
 }
 
 @Composable
+private fun SurfaceModeSelector(
+    selectedMode: SurfaceMode,
+    onModeChange: (SurfaceMode) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        SurfaceMode.entries.forEach { mode ->
+            Button(
+                onClick = { onModeChange(mode) },
+                modifier = Modifier.weight(if (mode == SurfaceMode.FLEXIBLE) 1.45f else 1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (mode == selectedMode) Blue else Color(0xFF343C49)
+                ),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    horizontal = 7.dp,
+                    vertical = 8.dp
+                )
+            ) {
+                Text(mode.label, fontSize = 10.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
 private fun CornerProgress(confirmedCorners: Int) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -448,6 +503,12 @@ private fun projectPoseToPlane(sourcePose: Pose, plane: Plane): Pose {
     localPoint[1] = 0f
     val pointOnWall = planePose.transformPoint(localPoint)
     return Pose(pointOnWall, planePose.rotationQuaternion)
+}
+
+private fun planeMatchesMode(plane: Plane, mode: SurfaceMode): Boolean = when (mode) {
+    SurfaceMode.WALL -> plane.type == Plane.Type.VERTICAL
+    SurfaceMode.FLOOR -> plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING
+    SurfaceMode.FLEXIBLE -> plane.type == Plane.Type.VERTICAL
 }
 
 private fun cornerInstruction(confirmedCount: Int): String = when (confirmedCount) {
