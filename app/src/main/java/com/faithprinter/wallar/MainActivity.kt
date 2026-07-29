@@ -93,6 +93,7 @@ private fun FaithWallAR() {
     var cornerPoses by remember { mutableStateOf<List<Pose>>(emptyList()) }
     var selectedWall by remember { mutableStateOf<Plane?>(null) }
     val latestFrame = remember { AtomicReference<Frame?>(null) }
+    val latestVerticalWall = remember { AtomicReference<Plane?>(null) }
     val engine = rememberEngine()
 
     fun resetWallSelection(message: String) {
@@ -133,9 +134,11 @@ private fun FaithWallAR() {
             planeRenderer = !locked,
             onSessionUpdated = { session, frame ->
                 latestFrame.set(frame)
-                val found = session.getAllTrackables(Plane::class.java).any {
+                val detectedWall = session.getAllTrackables(Plane::class.java).firstOrNull {
                     it.type == Plane.Type.VERTICAL && it.trackingState == TrackingState.TRACKING
                 }
+                latestVerticalWall.set(detectedWall)
+                val found = detectedWall != null
                 if (found != wallVisible) wallVisible = found
                 if (found && anchor == null && cornerPoses.isEmpty()) {
                     trackingMessage = "墙面已识别，请把准星对准左上角"
@@ -183,7 +186,7 @@ private fun FaithWallAR() {
             bitmap = bitmap,
             widthMeters = widthMeters,
             status = if (bitmap == null) "请先导入需要打印的图片" else trackingMessage,
-            canConfirmCorner = bitmap != null && wallVisible,
+            canConfirmCorner = bitmap != null,
             confirmedCorners = cornerPoses.size,
             placed = anchor != null,
             locked = locked,
@@ -192,28 +195,29 @@ private fun FaithWallAR() {
             onConfirmCorner = {
                 val frame = latestFrame.get()
                 if (frame != null && viewport != IntSize.Zero) {
-                    val hit = frame.hitTest(
+                    val hits = frame.hitTest(
                         viewport.width / 2f,
                         viewport.height / 2f
-                    ).firstOrNull { result ->
+                    )
+                    val verticalPlaneHit = hits.firstOrNull { result ->
                         val plane = result.trackable as? Plane
                         plane != null &&
                             plane.type == Plane.Type.VERTICAL &&
-                            plane.trackingState == TrackingState.TRACKING &&
-                            plane.isPoseInPolygon(result.hitPose) &&
-                            (selectedWall == null || plane == selectedWall)
+                            plane.trackingState == TrackingState.TRACKING
                     }
+                    val plane = selectedWall
+                        ?: (verticalPlaneHit?.trackable as? Plane)
+                        ?: latestVerticalWall.get()
+                    val positionHit = verticalPlaneHit ?: hits.firstOrNull()
 
-                    val plane = hit?.trackable as? Plane
-                    if (hit == null || plane == null) {
-                        trackingMessage = if (selectedWall == null) {
-                            "准星没有对准墙面，请稍微移动设备后重试"
-                        } else {
-                            "请继续在同一面墙上确认下一个角"
-                        }
+                    if (plane == null) {
+                        trackingMessage = "尚未识别墙面，请缓慢左右移动设备后再次点击"
+                    } else if (positionHit == null) {
+                        trackingMessage = "这个位置暂时没有深度信息，请稍微移动设备后再次点击"
                     } else {
                         if (selectedWall == null) selectedWall = plane
-                        val updatedCorners = cornerPoses + hit.hitPose
+                        val cornerOnWall = projectPoseToPlane(positionHit.hitPose, plane)
+                        val updatedCorners = cornerPoses + cornerOnWall
                         cornerPoses = updatedCorners
 
                         if (updatedCorners.size == 4) {
@@ -434,6 +438,16 @@ private fun wallCenterPose(corners: List<Pose>): Pose {
         corners.map { it.tz() }.average().toFloat()
     )
     return Pose(translation, corners.first().rotationQuaternion)
+}
+
+private fun projectPoseToPlane(sourcePose: Pose, plane: Plane): Pose {
+    val planePose = plane.centerPose
+    val localPoint = planePose.inverse().transformPoint(
+        floatArrayOf(sourcePose.tx(), sourcePose.ty(), sourcePose.tz())
+    )
+    localPoint[1] = 0f
+    val pointOnWall = planePose.transformPoint(localPoint)
+    return Pose(pointOnWall, planePose.rotationQuaternion)
 }
 
 private fun cornerInstruction(confirmedCount: Int): String = when (confirmedCount) {
