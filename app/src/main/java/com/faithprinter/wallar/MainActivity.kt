@@ -6,11 +6,13 @@ import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.opengl.Matrix
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -38,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -61,6 +65,7 @@ import io.github.sceneview.node.ImageNode
 import io.github.sceneview.rememberEngine
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.round
+import kotlin.math.sqrt
 
 private val Ink = Color(0xFF080B0F)
 private val Panel = Color(0xE9141820)
@@ -69,8 +74,7 @@ private val Muted = Color(0xFF9AA7B8)
 
 private enum class SurfaceMode(val label: String) {
     WALL("墙面"),
-    FLOOR("地面"),
-    FLEXIBLE("卷帘门/集装箱")
+    FLOOR("地面")
 }
 
 class MainActivity : ComponentActivity() {
@@ -99,6 +103,9 @@ private fun FaithWallAR() {
     var cornerPoses by remember { mutableStateOf<List<Pose>>(emptyList()) }
     var selectedWall by remember { mutableStateOf<Plane?>(null) }
     var surfaceMode by remember { mutableStateOf(SurfaceMode.WALL) }
+    var measuredWidth by remember { mutableFloatStateOf(0f) }
+    var measuredHeight by remember { mutableFloatStateOf(0f) }
+    var overlayPoints by remember { mutableStateOf<List<Offset>>(emptyList()) }
     val latestFrame = remember { AtomicReference<Frame?>(null) }
     val latestVerticalWall = remember { AtomicReference<Plane?>(null) }
     val engine = rememberEngine()
@@ -109,6 +116,9 @@ private fun FaithWallAR() {
         locked = false
         cornerPoses = emptyList()
         selectedWall = null
+        measuredWidth = 0f
+        measuredHeight = 0f
+        overlayPoints = emptyList()
         trackingMessage = message
     }
 
@@ -151,6 +161,9 @@ private fun FaithWallAR() {
                         it.trackingState == TrackingState.TRACKING
                 }
                 latestVerticalWall.set(detectedWall)
+                overlayPoints = cornerPoses.mapNotNull {
+                    projectPoseToScreen(it, frame, viewport)
+                }
                 val found = detectedWall != null
                 if (found != wallVisible) wallVisible = found
                 if (found && anchor == null && cornerPoses.isEmpty()) {
@@ -167,11 +180,13 @@ private fun FaithWallAR() {
             val currentBitmap = bitmap
             val currentAnchor = anchor
             if (currentBitmap != null && currentAnchor != null) {
-                val heightMeters = widthMeters * currentBitmap.height / currentBitmap.width.toFloat()
+                val previewWidth = measuredWidth.takeIf { it > 0f } ?: widthMeters
+                val previewHeight = measuredHeight.takeIf { it > 0f }
+                    ?: (previewWidth * currentBitmap.height / currentBitmap.width.toFloat())
                 AnchorNode(anchor = currentAnchor) {
                     ImageNode(
                         bitmap = currentBitmap,
-                        size = Size(widthMeters, heightMeters),
+                        size = Size(previewWidth, previewHeight),
                         apply = {
                             isShadowCaster = false
                             isShadowReceiver = false
@@ -187,6 +202,12 @@ private fun FaithWallAR() {
                 .padding(horizontal = 16.dp, vertical = 18.dp)
         )
 
+        MeasurementOverlay(
+            points = overlayPoints,
+            closed = cornerPoses.size == 4,
+            modifier = Modifier.fillMaxSize()
+        )
+
         if (anchor == null) {
             Reticle(
                 active = wallVisible,
@@ -198,6 +219,8 @@ private fun FaithWallAR() {
         Controls(
             bitmap = bitmap,
             widthMeters = widthMeters,
+            measuredWidth = measuredWidth,
+            measuredHeight = measuredHeight,
             status = if (bitmap == null && cornerPoses.isEmpty()) {
                 "可以先确认四角，也可以先导入图片"
             } else {
@@ -246,10 +269,14 @@ private fun FaithWallAR() {
 
                         if (updatedCorners.size == 4) {
                             val centerPose = wallCenterPose(updatedCorners)
+                            val dimensions = measuredDimensions(updatedCorners)
+                            measuredWidth = dimensions.first
+                            measuredHeight = dimensions.second
                             anchor?.detach()
                             anchor = plane.createAnchor(centerPose)
                             locked = true
-                            trackingMessage = "四角已确认，图片已锁定在这面墙上"
+                            trackingMessage = "测量完成：${format(measuredWidth)} × ${format(measuredHeight)} m"
+                            if (bitmap == null) imagePicker.launch("image/*")
                         } else {
                             trackingMessage = cornerInstruction(updatedCorners.size)
                         }
@@ -258,6 +285,16 @@ private fun FaithWallAR() {
             },
             onReposition = {
                 resetWallSelection("请重新确认墙面的左上角")
+            },
+            onUndoCorner = {
+                if (anchor == null && cornerPoses.isNotEmpty()) {
+                    cornerPoses = cornerPoses.dropLast(1)
+                    trackingMessage = if (cornerPoses.isEmpty()) {
+                        "请把准星对准左上角"
+                    } else {
+                        cornerInstruction(cornerPoses.size)
+                    }
+                }
             },
             onLockToggle = { locked = !locked },
             modifier = Modifier
@@ -269,20 +306,47 @@ private fun FaithWallAR() {
 
 @Composable
 private fun BrandHeader(modifier: Modifier = Modifier) {
-    Column(
+    Row(
         modifier = modifier
-            .background(Panel, RoundedCornerShape(18.dp))
-            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
-            .padding(horizontal = 14.dp, vertical = 8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .background(Panel, RoundedCornerShape(22.dp))
+            .border(1.dp, Color.White.copy(alpha = .10f), RoundedCornerShape(22.dp))
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
         Image(
-            painter = painterResource(R.drawable.faith_printer_logo),
+            painter = painterResource(R.drawable.faith_app_icon_v2),
             contentDescription = "FAITH PRINTER",
-            modifier = Modifier.size(width = 210.dp, height = 94.dp),
+            modifier = Modifier.size(34.dp),
             contentScale = ContentScale.Fit
         )
-        Text("WALL AR · TRUE SIZE", color = Muted, fontSize = 9.sp, letterSpacing = 2.sp)
+        Text(
+            "FAITH  MEASURE AR",
+            modifier = Modifier.padding(horizontal = 9.dp),
+            color = Color.White,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp
+        )
+    }
+}
+
+@Composable
+private fun MeasurementOverlay(
+    points: List<Offset>,
+    closed: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        points.zipWithNext().forEach { (start, end) ->
+            drawLine(Blue, start, end, strokeWidth = 5f)
+        }
+        if (closed && points.size == 4) {
+            drawLine(Blue, points.last(), points.first(), strokeWidth = 5f)
+        }
+        points.forEach { point ->
+            drawCircle(Color.White, radius = 13f, center = point)
+            drawCircle(Blue, radius = 8f, center = point)
+        }
     }
 }
 
@@ -294,15 +358,14 @@ private fun Reticle(
 ) {
     Box(
         modifier = modifier
-            .size(58.dp)
-            .border(2.dp, if (active) Blue else Color.White.copy(alpha = .55f), CircleShape),
+            .size(46.dp)
+            .border(2.dp, if (active) Blue else Color.White.copy(alpha = .70f), CircleShape),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text = cornerNumber.coerceAtMost(4).toString(),
-            color = if (active) Blue else Color.White,
-            fontWeight = FontWeight.Bold,
-            fontSize = 18.sp
+        Box(
+            Modifier
+                .size(7.dp)
+                .background(if (active) Blue else Color.White, CircleShape)
         )
     }
 }
@@ -311,6 +374,8 @@ private fun Reticle(
 private fun Controls(
     bitmap: Bitmap?,
     widthMeters: Float,
+    measuredWidth: Float,
+    measuredHeight: Float,
     status: String,
     canConfirmCorner: Boolean,
     confirmedCorners: Int,
@@ -322,95 +387,74 @@ private fun Controls(
     onWidthChange: (Float) -> Unit,
     onConfirmCorner: () -> Unit,
     onReposition: () -> Unit,
+    onUndoCorner: () -> Unit,
     onLockToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val heightMeters = bitmap?.let { widthMeters * it.height / it.width.toFloat() }
     Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(Panel, RoundedCornerShape(24.dp))
-            .border(1.dp, Color.White.copy(alpha = .08f), RoundedCornerShape(24.dp))
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(11.dp)
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(status, color = Color.White, fontSize = 13.sp)
+        Text(
+            text = if (measuredWidth > 0f) {
+                "${format(measuredWidth)} × ${format(measuredHeight)} m"
+            } else {
+                status
+            },
+            modifier = Modifier
+                .background(Panel, RoundedCornerShape(18.dp))
+                .border(1.dp, Color.White.copy(alpha = .10f), RoundedCornerShape(18.dp))
+                .padding(horizontal = 15.dp, vertical = 9.dp),
+            color = Color.White,
+            fontSize = 13.sp,
+            fontWeight = if (measuredWidth > 0f) FontWeight.Bold else FontWeight.Normal
+        )
 
         SurfaceModeSelector(surfaceMode, onSurfaceModeChange)
 
-        if (!placed) {
-            CornerProgress(confirmedCorners)
-        }
-
-        if (bitmap != null) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("真实宽度", color = Muted, fontSize = 12.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SmallButton("−") { onWidthChange(round1(widthMeters - 0.1f)) }
-                    Text(
-                        "${format(widthMeters)} × ${format(heightMeters ?: 0f)} m",
-                        modifier = Modifier.padding(horizontal = 12.dp),
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold
-                    )
-                    SmallButton("+") { onWidthChange(round1(widthMeters + 0.1f)) }
-                }
-            }
-        }
-
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(9.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Panel, RoundedCornerShape(30.dp))
+                .border(1.dp, Color.White.copy(alpha = .10f), RoundedCornerShape(30.dp))
+                .padding(horizontal = 13.dp, vertical = 11.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
         ) {
             OutlinedButton(
-                onClick = onImport,
-                modifier = Modifier.weight(1f),
+                onClick = if (placed) onReposition else onUndoCorner,
+                enabled = placed || confirmedCorners > 0,
+                modifier = Modifier.size(width = 92.dp, height = 48.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
             ) {
-                Text(if (bitmap == null) "导入图片" else "更换图片")
+                Text(if (placed) "重新测量" else "撤销", fontSize = 12.sp)
             }
 
-            if (!placed) {
-                Button(
-                    onClick = onConfirmCorner,
-                    enabled = canConfirmCorner,
-                    modifier = Modifier.weight(1.25f),
-                    colors = ButtonDefaults.buttonColors(containerColor = Blue)
-                ) {
-                    Text(cornerButtonLabel(confirmedCorners))
-                }
-            } else {
-                Button(
-                    onClick = onLockToggle,
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (locked) Blue else Color(0xFF343C49)
-                    )
-                ) {
-                    Text(if (locked) "已锁定" else "未锁定")
-                }
-                OutlinedButton(
-                    onClick = onReposition,
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
-                ) {
-                    Text("重选四角")
-                }
+            Button(
+                onClick = if (placed) onLockToggle else onConfirmCorner,
+                enabled = placed || canConfirmCorner,
+                modifier = Modifier.size(72.dp),
+                shape = CircleShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (placed && !locked) Color(0xFF343C49) else Blue
+                ),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+            ) {
+                Text(
+                    if (placed) "锁定" else "+",
+                    fontSize = if (placed) 12.sp else 38.sp
+                )
+            }
+
+            OutlinedButton(
+                onClick = onImport,
+                modifier = Modifier.size(width = 92.dp, height = 48.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+            ) {
+                Text(if (bitmap == null) "选择图片" else "更换图片", fontSize = 12.sp)
             }
         }
-
-        Text(
-            "PRINT YOUR VISION. ON ANY WALL.",
-            modifier = Modifier.fillMaxWidth(),
-            color = Muted,
-            fontSize = 9.sp,
-            letterSpacing = 2.sp,
-            textAlign = TextAlign.Center
-        )
     }
 }
 
@@ -420,69 +464,27 @@ private fun SurfaceModeSelector(
     onModeChange: (SurfaceMode) -> Unit
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .background(Panel, RoundedCornerShape(22.dp))
+            .border(1.dp, Color.White.copy(alpha = .10f), RoundedCornerShape(22.dp))
+            .padding(4.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         SurfaceMode.entries.forEach { mode ->
             Button(
                 onClick = { onModeChange(mode) },
-                modifier = Modifier.weight(if (mode == SurfaceMode.FLEXIBLE) 1.45f else 1f),
+                modifier = Modifier.size(width = 88.dp, height = 38.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (mode == selectedMode) Blue else Color(0xFF343C49)
+                    containerColor = if (mode == selectedMode) Blue else Color.Transparent
                 ),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
                     horizontal = 7.dp,
                     vertical = 8.dp
                 )
             ) {
-                Text(mode.label, fontSize = 10.sp, maxLines = 1)
+                Text(mode.label, fontSize = 12.sp, maxLines = 1)
             }
         }
-    }
-}
-
-@Composable
-private fun CornerProgress(confirmedCorners: Int) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center
-    ) {
-        listOf("左上", "右上", "右下", "左下").forEachIndexed { index, label ->
-            Column(
-                modifier = Modifier.padding(horizontal = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(24.dp)
-                        .background(
-                            if (index < confirmedCorners) Blue else Color(0xFF343C49),
-                            CircleShape
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (index < confirmedCorners) "✓" else "${index + 1}",
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-                Text(label, color = Muted, fontSize = 9.sp)
-            }
-        }
-    }
-}
-
-@Composable
-private fun SmallButton(label: String, onClick: () -> Unit) {
-    OutlinedButton(
-        onClick = onClick,
-        modifier = Modifier.size(40.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
-    ) {
-        Text(label, fontSize = 19.sp)
     }
 }
 
@@ -505,10 +507,54 @@ private fun projectPoseToPlane(sourcePose: Pose, plane: Plane): Pose {
     return Pose(pointOnWall, planePose.rotationQuaternion)
 }
 
+private fun projectPoseToScreen(
+    pose: Pose,
+    frame: Frame,
+    viewport: IntSize
+): Offset? {
+    if (viewport == IntSize.Zero) return null
+    val view = FloatArray(16)
+    val projection = FloatArray(16)
+    val viewProjection = FloatArray(16)
+    val clip = FloatArray(4)
+    frame.camera.getViewMatrix(view, 0)
+    frame.camera.getProjectionMatrix(projection, 0, 0.1f, 100f)
+    Matrix.multiplyMM(viewProjection, 0, projection, 0, view, 0)
+    Matrix.multiplyMV(
+        clip,
+        0,
+        viewProjection,
+        0,
+        floatArrayOf(pose.tx(), pose.ty(), pose.tz(), 1f),
+        0
+    )
+    if (clip[3] <= 0f) return null
+    val normalizedX = clip[0] / clip[3]
+    val normalizedY = clip[1] / clip[3]
+    return Offset(
+        x = (normalizedX + 1f) * .5f * viewport.width,
+        y = (1f - normalizedY) * .5f * viewport.height
+    )
+}
+
+private fun measuredDimensions(corners: List<Pose>): Pair<Float, Float> {
+    val top = poseDistance(corners[0], corners[1])
+    val right = poseDistance(corners[1], corners[2])
+    val bottom = poseDistance(corners[3], corners[2])
+    val left = poseDistance(corners[0], corners[3])
+    return Pair((top + bottom) / 2f, (left + right) / 2f)
+}
+
+private fun poseDistance(a: Pose, b: Pose): Float {
+    val dx = a.tx() - b.tx()
+    val dy = a.ty() - b.ty()
+    val dz = a.tz() - b.tz()
+    return sqrt(dx * dx + dy * dy + dz * dz)
+}
+
 private fun planeMatchesMode(plane: Plane, mode: SurfaceMode): Boolean = when (mode) {
     SurfaceMode.WALL -> plane.type == Plane.Type.VERTICAL
     SurfaceMode.FLOOR -> plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING
-    SurfaceMode.FLEXIBLE -> plane.type == Plane.Type.VERTICAL
 }
 
 private fun cornerInstruction(confirmedCount: Int): String = when (confirmedCount) {
