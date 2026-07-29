@@ -302,7 +302,11 @@ private fun FaithWallAR() {
             } else {
                 trackingMessage
             },
-            canConfirmCorner = depthReady || wallVisible,
+            canConfirmCorner = if (cornerPoses.isEmpty()) {
+                depthReady || wallVisible
+            } else {
+                true
+            },
             confirmedCorners = cornerPoses.size,
             placed = anchor != null,
             locked = locked,
@@ -359,8 +363,10 @@ private fun FaithWallAR() {
                     val firstSurfacePose = cornerPoses.firstOrNull()
                     val exactDepthHit = if (
                         depthSupported &&
-                        depthReady &&
-                        (firstSurfacePose == null || selectionUsesDepth)
+                        (
+                            (firstSurfacePose == null && depthReady) ||
+                                (firstSurfacePose != null && selectionUsesDepth)
+                            )
                     ) {
                         hits.firstOrNull { result ->
                             result.trackable is DepthPoint &&
@@ -378,11 +384,18 @@ private fun FaithWallAR() {
                         plane != null &&
                             planeMatchesMode(plane, surfaceMode) &&
                             plane.trackingState == TrackingState.TRACKING &&
-                            (lockedPlane == null || plane === lockedPlane)
+                            when {
+                                firstSurfacePose == null ->
+                                    lockedPlane == null || plane === lockedPlane
+                                selectionUsesDepth ->
+                                    poseBelongsToSurface(result.hitPose, firstSurfacePose)
+                                else ->
+                                    lockedPlane == null || plane === lockedPlane
+                            }
                     }
                     val chosenHit = when {
                         firstSurfacePose == null -> exactDepthHit ?: exactPlaneHit
-                        selectionUsesDepth -> exactDepthHit
+                        selectionUsesDepth -> exactDepthHit ?: exactPlaneHit
                         else -> exactPlaneHit
                     }
 
@@ -919,7 +932,7 @@ private fun poseBelongsToSurface(candidate: Pose, reference: Pose): Boolean {
         candidate.tz() - reference.tz()
     )
     val distanceFromPlane = abs(dot(delta, referenceNormal))
-    return normalAgreement > 0.90f && distanceFromPlane < 0.06f
+    return normalAgreement > 0.80f && distanceFromPlane < 0.15f
 }
 
 private fun depthSamplesStable(samples: Collection<Pose>): Boolean {
