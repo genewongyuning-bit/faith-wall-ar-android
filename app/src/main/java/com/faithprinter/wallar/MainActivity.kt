@@ -30,6 +30,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -72,9 +73,11 @@ private val Panel = Color(0xE9141820)
 private val Blue = Color(0xFF157AF6)
 private val Muted = Color(0xFF9AA7B8)
 
-private enum class SurfaceMode(val label: String) {
-    WALL("墙面"),
-    FLOOR("地面")
+private enum class SurfaceMode { WALL, FLOOR }
+private enum class AppLanguage { ZH, EN }
+private enum class UnitSystem(val metersPerUnit: Float) {
+    METRIC(1f),
+    IMPERIAL(0.3048f)
 }
 
 class MainActivity : ComponentActivity() {
@@ -103,6 +106,9 @@ private fun FaithWallAR() {
     var cornerPoses by remember { mutableStateOf<List<Pose>>(emptyList()) }
     var selectedWall by remember { mutableStateOf<Plane?>(null) }
     var surfaceMode by remember { mutableStateOf(SurfaceMode.WALL) }
+    var language by remember { mutableStateOf(AppLanguage.ZH) }
+    var unitSystem by remember { mutableStateOf(UnitSystem.METRIC) }
+    var widthInput by remember { mutableStateOf("1.20") }
     var measuredWidth by remember { mutableFloatStateOf(0f) }
     var measuredHeight by remember { mutableFloatStateOf(0f) }
     var overlayPoints by remember { mutableStateOf<List<Offset>>(emptyList()) }
@@ -130,9 +136,9 @@ private fun FaithWallAR() {
             bitmap?.recycle()
             bitmap = it
             trackingMessage = if (anchor != null) {
-                "图片已导入，并已固定在确认区域"
+                tr(language, "图片已导入，已按真实尺寸固定", "Image imported at true size")
             } else {
-                "图片已导入，现在可以确认四个角"
+                tr(language, "图片已导入，现在可以确认四个角", "Image imported. Confirm four corners")
             }
         }
     }
@@ -167,22 +173,30 @@ private fun FaithWallAR() {
                 val found = detectedWall != null
                 if (found != wallVisible) wallVisible = found
                 if (found && anchor == null && cornerPoses.isEmpty()) {
-                    trackingMessage = "${surfaceMode.label}已识别，请把准星对准左上角"
+                    trackingMessage = tr(
+                        language,
+                        "${surfaceModeLabel(surfaceMode, language)}已识别，请把准星对准左上角",
+                        "${surfaceModeLabel(surfaceMode, language)} detected. Aim at top-left"
+                    )
                 }
             },
             onTrackingFailureChanged = { reason ->
-                if (cornerPoses.isEmpty()) trackingMessage = trackingHint(reason)
+                if (cornerPoses.isEmpty()) trackingMessage = trackingHint(reason, language, surfaceMode)
             },
             onSessionFailed = {
-                trackingMessage = "无法启动 AR：请确认设备支持 Google Play AR 服务"
+                trackingMessage = tr(
+                    language,
+                    "无法启动 AR：请确认设备支持 Google Play AR 服务",
+                    "AR could not start. Check Google Play Services for AR"
+                )
             }
         ) {
             val currentBitmap = bitmap
             val currentAnchor = anchor
             if (currentBitmap != null && currentAnchor != null) {
-                val previewWidth = measuredWidth.takeIf { it > 0f } ?: widthMeters
-                val previewHeight = measuredHeight.takeIf { it > 0f }
-                    ?: (previewWidth * currentBitmap.height / currentBitmap.width.toFloat())
+                val previewWidth = widthMeters
+                val previewHeight =
+                    previewWidth * currentBitmap.height / currentBitmap.width.toFloat()
                 AnchorNode(anchor = currentAnchor) {
                     ImageNode(
                         bitmap = currentBitmap,
@@ -222,7 +236,11 @@ private fun FaithWallAR() {
             measuredWidth = measuredWidth,
             measuredHeight = measuredHeight,
             status = if (bitmap == null && cornerPoses.isEmpty()) {
-                "可以先确认四角，也可以先导入图片"
+                tr(
+                    language,
+                    "可以先确认四角，也可以先导入图片",
+                    "Measure four corners or choose an image first"
+                )
             } else {
                 trackingMessage
             },
@@ -231,14 +249,47 @@ private fun FaithWallAR() {
             placed = anchor != null,
             locked = locked,
             surfaceMode = surfaceMode,
+            language = language,
+            unitSystem = unitSystem,
+            widthInput = widthInput,
             onImport = { imagePicker.launch("image/*") },
             onSurfaceModeChange = { mode ->
                 if (mode != surfaceMode) {
                     surfaceMode = mode
-                    resetWallSelection("已切换到${mode.label}模式，请确认左上角")
+                    resetWallSelection(
+                        tr(
+                            language,
+                            "已切换到${surfaceModeLabel(mode, language)}模式，请确认左上角",
+                            "${surfaceModeLabel(mode, language)} mode. Confirm top-left"
+                        )
+                    )
                 }
             },
-            onWidthChange = { widthMeters = it.coerceIn(0.2f, 10f) },
+            onLanguageChange = { next ->
+                language = next
+                trackingMessage = if (cornerPoses.isEmpty()) {
+                    tr(
+                        next,
+                        "移动设备，缓慢扫描${surfaceModeLabel(surfaceMode, next)}",
+                        "Move slowly to scan the ${surfaceModeLabel(surfaceMode, next).lowercase()}"
+                    )
+                } else {
+                    cornerInstruction(cornerPoses.size, next, surfaceMode)
+                }
+            },
+            onUnitSystemChange = { next ->
+                if (next != unitSystem) {
+                    unitSystem = next
+                    widthInput = format(widthMeters / next.metersPerUnit)
+                }
+            },
+            onWidthInputChange = { text ->
+                val cleaned = sanitizeDecimal(text)
+                widthInput = cleaned
+                cleaned.toFloatOrNull()?.takeIf { it > 0f }?.let { value ->
+                    widthMeters = (value * unitSystem.metersPerUnit).coerceIn(0.05f, 30f)
+                }
+            },
             onConfirmCorner = {
                 val frame = latestFrame.get()
                 if (frame != null && viewport != IntSize.Zero) {
@@ -258,9 +309,17 @@ private fun FaithWallAR() {
                     val positionHit = verticalPlaneHit ?: hits.firstOrNull()
 
                     if (plane == null) {
-                        trackingMessage = "尚未识别${surfaceMode.label}，请缓慢移动设备后再次点击"
+                        trackingMessage = tr(
+                            language,
+                            "尚未识别${surfaceModeLabel(surfaceMode, language)}，请缓慢移动设备后再次点击",
+                            "No ${surfaceModeLabel(surfaceMode, language).lowercase()} detected. Move slowly and try again"
+                        )
                     } else if (positionHit == null) {
-                        trackingMessage = "这个位置暂时没有深度信息，请稍微移动设备后再次点击"
+                        trackingMessage = tr(
+                            language,
+                            "这个位置暂时没有深度信息，请稍微移动设备后再次点击",
+                            "No depth data here. Move slightly and try again"
+                        )
                     } else {
                         if (selectedWall == null) selectedWall = plane
                         val cornerOnWall = projectPoseToPlane(positionHit.hitPose, plane)
@@ -275,24 +334,35 @@ private fun FaithWallAR() {
                             anchor?.detach()
                             anchor = plane.createAnchor(centerPose)
                             locked = true
-                            trackingMessage = "测量完成：${format(measuredWidth)} × ${format(measuredHeight)} m"
+                            trackingMessage = tr(
+                                language,
+                                "平面已确认，请输入图片真实宽度",
+                                "Surface confirmed. Enter the real image width"
+                            )
                             if (bitmap == null) imagePicker.launch("image/*")
                         } else {
-                            trackingMessage = cornerInstruction(updatedCorners.size)
+                            trackingMessage =
+                                cornerInstruction(updatedCorners.size, language, surfaceMode)
                         }
                     }
                 }
             },
             onReposition = {
-                resetWallSelection("请重新确认墙面的左上角")
+                resetWallSelection(
+                    tr(
+                        language,
+                        "请重新确认${surfaceModeLabel(surfaceMode, language)}的左上角",
+                        "Confirm the top-left of the ${surfaceModeLabel(surfaceMode, language).lowercase()}"
+                    )
+                )
             },
             onUndoCorner = {
                 if (anchor == null && cornerPoses.isNotEmpty()) {
                     cornerPoses = cornerPoses.dropLast(1)
                     trackingMessage = if (cornerPoses.isEmpty()) {
-                        "请把准星对准左上角"
+                        tr(language, "请把准星对准左上角", "Aim at the top-left")
                     } else {
-                        cornerInstruction(cornerPoses.size)
+                        cornerInstruction(cornerPoses.size, language, surfaceMode)
                     }
                 }
             },
@@ -382,15 +452,28 @@ private fun Controls(
     placed: Boolean,
     locked: Boolean,
     surfaceMode: SurfaceMode,
+    language: AppLanguage,
+    unitSystem: UnitSystem,
+    widthInput: String,
     onImport: () -> Unit,
     onSurfaceModeChange: (SurfaceMode) -> Unit,
-    onWidthChange: (Float) -> Unit,
+    onLanguageChange: (AppLanguage) -> Unit,
+    onUnitSystemChange: (UnitSystem) -> Unit,
+    onWidthInputChange: (String) -> Unit,
     onConfirmCorner: () -> Unit,
     onReposition: () -> Unit,
     onUndoCorner: () -> Unit,
     onLockToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val displayUnit = if (unitSystem == UnitSystem.METRIC) "m" else "ft"
+    val measuredWidthDisplay = measuredWidth / unitSystem.metersPerUnit
+    val measuredHeightDisplay = measuredHeight / unitSystem.metersPerUnit
+    val imageHeightMeters = bitmap?.let {
+        widthMeters * it.height / it.width.toFloat()
+    } ?: 0f
+    val imageHeightDisplay = imageHeightMeters / unitSystem.metersPerUnit
+
     Column(
         modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -398,7 +481,8 @@ private fun Controls(
     ) {
         Text(
             text = if (measuredWidth > 0f) {
-                "${format(measuredWidth)} × ${format(measuredHeight)} m"
+                tr(language, "已确认区域 ", "Selected area ") +
+                    "${format(measuredWidthDisplay)} × ${format(measuredHeightDisplay)} $displayUnit"
             } else {
                 status
             },
@@ -411,7 +495,68 @@ private fun Controls(
             fontWeight = if (measuredWidth > 0f) FontWeight.Bold else FontWeight.Normal
         )
 
-        SurfaceModeSelector(surfaceMode, onSurfaceModeChange)
+        SurfaceModeSelector(surfaceMode, language, onSurfaceModeChange)
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            CompactToggle(
+                first = "中文",
+                second = "EN",
+                firstSelected = language == AppLanguage.ZH,
+                onFirst = { onLanguageChange(AppLanguage.ZH) },
+                onSecond = { onLanguageChange(AppLanguage.EN) }
+            )
+            CompactToggle(
+                first = "m",
+                second = "ft",
+                firstSelected = unitSystem == UnitSystem.METRIC,
+                onFirst = { onUnitSystemChange(UnitSystem.METRIC) },
+                onSecond = { onUnitSystemChange(UnitSystem.IMPERIAL) }
+            )
+        }
+
+        if (bitmap != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Panel, RoundedCornerShape(22.dp))
+                    .border(1.dp, Color.White.copy(alpha = .10f), RoundedCornerShape(22.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = widthInput,
+                    onValueChange = onWidthInputChange,
+                    modifier = Modifier.size(width = 152.dp, height = 58.dp),
+                    label = {
+                        Text(tr(language, "真实宽度", "Print width"), fontSize = 11.sp)
+                    },
+                    suffix = { Text(displayUnit) },
+                    singleLine = true
+                )
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        tr(language, "自动高度", "Auto height"),
+                        color = Muted,
+                        fontSize = 11.sp
+                    )
+                    Text(
+                        "${format(imageHeightDisplay)} $displayUnit",
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        tr(language, "比例锁定 · 不拉伸", "Aspect locked · No stretch"),
+                        color = Blue,
+                        fontSize = 10.sp
+                    )
+                }
+            }
+        }
 
         Row(
             modifier = Modifier
@@ -428,7 +573,11 @@ private fun Controls(
                 modifier = Modifier.size(width = 92.dp, height = 48.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
             ) {
-                Text(if (placed) "重新测量" else "撤销", fontSize = 12.sp)
+                Text(
+                    if (placed) tr(language, "重新测量", "Re-measure")
+                    else tr(language, "撤销", "Undo"),
+                    fontSize = 12.sp
+                )
             }
 
             Button(
@@ -442,7 +591,7 @@ private fun Controls(
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
             ) {
                 Text(
-                    if (placed) "锁定" else "+",
+                    if (placed) tr(language, "锁定", "Lock") else "+",
                     fontSize = if (placed) 12.sp else 38.sp
                 )
             }
@@ -452,7 +601,11 @@ private fun Controls(
                 modifier = Modifier.size(width = 92.dp, height = 48.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
             ) {
-                Text(if (bitmap == null) "选择图片" else "更换图片", fontSize = 12.sp)
+                Text(
+                    if (bitmap == null) tr(language, "选择图片", "Image")
+                    else tr(language, "更换图片", "Replace"),
+                    fontSize = 12.sp
+                )
             }
         }
     }
@@ -461,6 +614,7 @@ private fun Controls(
 @Composable
 private fun SurfaceModeSelector(
     selectedMode: SurfaceMode,
+    language: AppLanguage,
     onModeChange: (SurfaceMode) -> Unit
 ) {
     Row(
@@ -482,7 +636,37 @@ private fun SurfaceModeSelector(
                     vertical = 8.dp
                 )
             ) {
-                Text(mode.label, fontSize = 12.sp, maxLines = 1)
+                Text(surfaceModeLabel(mode, language), fontSize = 12.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactToggle(
+    first: String,
+    second: String,
+    firstSelected: Boolean,
+    onFirst: () -> Unit,
+    onSecond: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .background(Panel, RoundedCornerShape(18.dp))
+            .border(1.dp, Color.White.copy(alpha = .10f), RoundedCornerShape(18.dp))
+            .padding(3.dp)
+    ) {
+        listOf(first to onFirst, second to onSecond).forEachIndexed { index, item ->
+            val selected = if (index == 0) firstSelected else !firstSelected
+            Button(
+                onClick = item.second,
+                modifier = Modifier.size(width = 42.dp, height = 32.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (selected) Blue else Color.Transparent
+                ),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+            ) {
+                Text(item.first, fontSize = 10.sp)
             }
         }
     }
@@ -494,7 +678,83 @@ private fun wallCenterPose(corners: List<Pose>): Pose {
         corners.map { it.ty() }.average().toFloat(),
         corners.map { it.tz() }.average().toFloat()
     )
-    return Pose(translation, corners.first().rotationQuaternion)
+    val xAxis = normalize(
+        floatArrayOf(
+            corners[1].tx() - corners[0].tx(),
+            corners[1].ty() - corners[0].ty(),
+            corners[1].tz() - corners[0].tz()
+        )
+    )
+    val roughZ = normalize(
+        floatArrayOf(
+            corners[3].tx() - corners[0].tx(),
+            corners[3].ty() - corners[0].ty(),
+            corners[3].tz() - corners[0].tz()
+        )
+    )
+    val yAxis = normalize(cross(roughZ, xAxis))
+    val zAxis = normalize(cross(xAxis, yAxis))
+    return Pose(translation, quaternionFromAxes(xAxis, yAxis, zAxis))
+}
+
+private fun normalize(vector: FloatArray): FloatArray {
+    val length = sqrt(
+        vector[0] * vector[0] +
+            vector[1] * vector[1] +
+            vector[2] * vector[2]
+    )
+    if (length < 0.0001f) return floatArrayOf(1f, 0f, 0f)
+    return floatArrayOf(vector[0] / length, vector[1] / length, vector[2] / length)
+}
+
+private fun cross(a: FloatArray, b: FloatArray): FloatArray = floatArrayOf(
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0]
+)
+
+private fun quaternionFromAxes(
+    x: FloatArray,
+    y: FloatArray,
+    z: FloatArray
+): FloatArray {
+    val m00 = x[0]
+    val m01 = y[0]
+    val m02 = z[0]
+    val m10 = x[1]
+    val m11 = y[1]
+    val m12 = z[1]
+    val m20 = x[2]
+    val m21 = y[2]
+    val m22 = z[2]
+    val trace = m00 + m11 + m22
+    val quaternion = FloatArray(4)
+    if (trace > 0f) {
+        val s = sqrt(trace + 1f) * 2f
+        quaternion[3] = 0.25f * s
+        quaternion[0] = (m21 - m12) / s
+        quaternion[1] = (m02 - m20) / s
+        quaternion[2] = (m10 - m01) / s
+    } else if (m00 > m11 && m00 > m22) {
+        val s = sqrt(1f + m00 - m11 - m22) * 2f
+        quaternion[3] = (m21 - m12) / s
+        quaternion[0] = 0.25f * s
+        quaternion[1] = (m01 + m10) / s
+        quaternion[2] = (m02 + m20) / s
+    } else if (m11 > m22) {
+        val s = sqrt(1f + m11 - m00 - m22) * 2f
+        quaternion[3] = (m02 - m20) / s
+        quaternion[0] = (m01 + m10) / s
+        quaternion[1] = 0.25f * s
+        quaternion[2] = (m12 + m21) / s
+    } else {
+        val s = sqrt(1f + m22 - m00 - m11) * 2f
+        quaternion[3] = (m10 - m01) / s
+        quaternion[0] = (m02 + m20) / s
+        quaternion[1] = (m12 + m21) / s
+        quaternion[2] = 0.25f * s
+    }
+    return quaternion
 }
 
 private fun projectPoseToPlane(sourcePose: Pose, plane: Plane): Pose {
@@ -557,19 +817,27 @@ private fun planeMatchesMode(plane: Plane, mode: SurfaceMode): Boolean = when (m
     SurfaceMode.FLOOR -> plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING
 }
 
-private fun cornerInstruction(confirmedCount: Int): String = when (confirmedCount) {
-    1 -> "左上角已确认，请对准右上角"
-    2 -> "右上角已确认，请对准右下角"
-    3 -> "右下角已确认，请对准左下角"
-    else -> "请确认墙面的四个角"
+private fun tr(language: AppLanguage, zh: String, en: String): String =
+    if (language == AppLanguage.ZH) zh else en
+
+private fun surfaceModeLabel(mode: SurfaceMode, language: AppLanguage): String = when (mode) {
+    SurfaceMode.WALL -> tr(language, "墙面", "Wall")
+    SurfaceMode.FLOOR -> tr(language, "地面", "Floor")
 }
 
-private fun cornerButtonLabel(confirmedCount: Int): String = when (confirmedCount) {
-    0 -> "确认左上角"
-    1 -> "确认右上角"
-    2 -> "确认右下角"
-    3 -> "确认左下角"
-    else -> "四角已确认"
+private fun cornerInstruction(
+    confirmedCount: Int,
+    language: AppLanguage,
+    mode: SurfaceMode
+): String = when (confirmedCount) {
+    1 -> tr(language, "左上角已确认，请对准右上角", "Top-left confirmed. Aim at top-right")
+    2 -> tr(language, "右上角已确认，请对准右下角", "Top-right confirmed. Aim at bottom-right")
+    3 -> tr(language, "右下角已确认，请对准左下角", "Bottom-right confirmed. Aim at bottom-left")
+    else -> tr(
+        language,
+        "请确认${surfaceModeLabel(mode, language)}的四个角",
+        "Confirm four corners on the ${surfaceModeLabel(mode, language).lowercase()}"
+    )
 }
 
 private fun decodeBitmap(context: android.content.Context, uri: Uri): Bitmap? =
@@ -584,13 +852,37 @@ private fun decodeBitmap(context: android.content.Context, uri: Uri): Bitmap? =
         }
     }.getOrNull()
 
-private fun trackingHint(reason: TrackingFailureReason?): String = when (reason) {
-    TrackingFailureReason.INSUFFICIENT_LIGHT -> "光线不足，请打开灯或移到更亮的位置"
-    TrackingFailureReason.EXCESSIVE_MOTION -> "移动过快，请放慢速度"
-    TrackingFailureReason.INSUFFICIENT_FEATURES -> "墙面纹理太少，请从斜角缓慢扫描"
-    TrackingFailureReason.CAMERA_UNAVAILABLE -> "摄像头不可用，请关闭其他相机应用"
-    TrackingFailureReason.BAD_STATE -> "AR 状态异常，请重新打开应用"
-    else -> "移动设备，缓慢扫描墙面"
+private fun trackingHint(
+    reason: TrackingFailureReason?,
+    language: AppLanguage,
+    mode: SurfaceMode
+): String = when (reason) {
+    TrackingFailureReason.INSUFFICIENT_LIGHT ->
+        tr(language, "光线不足，请打开灯或移到更亮的位置", "Not enough light. Move somewhere brighter")
+    TrackingFailureReason.EXCESSIVE_MOTION ->
+        tr(language, "移动过快，请放慢速度", "Moving too fast. Slow down")
+    TrackingFailureReason.INSUFFICIENT_FEATURES ->
+        tr(language, "表面纹理太少，请从斜角缓慢扫描", "Not enough surface detail. Scan slowly at an angle")
+    TrackingFailureReason.CAMERA_UNAVAILABLE ->
+        tr(language, "摄像头不可用，请关闭其他相机应用", "Camera unavailable. Close other camera apps")
+    TrackingFailureReason.BAD_STATE ->
+        tr(language, "AR 状态异常，请重新打开应用", "AR error. Reopen the app")
+    else -> tr(
+        language,
+        "移动设备，缓慢扫描${surfaceModeLabel(mode, language)}",
+        "Move slowly to scan the ${surfaceModeLabel(mode, language).lowercase()}"
+    )
+}
+
+private fun sanitizeDecimal(value: String): String {
+    val filtered = value.filter { it.isDigit() || it == '.' }
+    val firstDot = filtered.indexOf('.')
+    return if (firstDot < 0) {
+        filtered.take(6)
+    } else {
+        filtered.substring(0, firstDot + 1) +
+            filtered.substring(firstDot + 1).replace(".", "").take(2)
+    }
 }
 
 private fun round1(value: Float): Float = round(value * 10f) / 10f
