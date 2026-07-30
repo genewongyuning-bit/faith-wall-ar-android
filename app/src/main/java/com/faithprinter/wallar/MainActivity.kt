@@ -155,6 +155,31 @@ private fun FaithWallAR() {
         }
     }
 
+    fun acceptCorner(cornerPose: Pose) {
+        val updatedCorners = cornerPoses + cornerPose
+        cornerPoses = updatedCorners
+        if (updatedCorners.size == 4) {
+            val centerPose = wallCenterPose(updatedCorners)
+            val fittedCorners = snapCornersToPlane(updatedCorners, centerPose)
+            cornerPoses = fittedCorners
+            val dimensions = measuredDimensions(fittedCorners)
+            measuredWidth = dimensions.first
+            measuredHeight = dimensions.second
+            anchor?.detach()
+            anchor = latestSession.get()?.createAnchor(centerPose)
+            locked = true
+            trackingMessage = tr(
+                language,
+                "平面已确认，请输入图片真实宽度",
+                "Surface confirmed. Enter the real image width"
+            )
+            if (bitmap == null) imagePicker.launch("image/*")
+        } else {
+            trackingMessage =
+                cornerInstruction(updatedCorners.size, language, surfaceMode)
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             anchor?.detach()
@@ -352,29 +377,38 @@ private fun FaithWallAR() {
                     widthMeters = (value * unitSystem.metersPerUnit).coerceIn(0.05f, 30f)
                 }
             },
-            onConfirmCorner = {
+            onConfirmCorner = confirmCorner@{
                 val frame = latestFrame.get()
                 if (frame != null && viewport != IntSize.Zero) {
+                    val firstSurfacePose = cornerPoses.firstOrNull()
+                    if (firstSurfacePose != null) {
+                        val nextCorner = centerRayIntersectionWithPlane(
+                            frame.camera.pose,
+                            firstSurfacePose
+                        )
+                        if (nextCorner != null) {
+                            acceptCorner(nextCorner)
+                        } else {
+                            trackingMessage = tr(
+                                language,
+                                "手机角度与平面过于平行，请稍微正对目标后再确认",
+                                "Camera angle is too parallel. Face the surface and try again"
+                            )
+                        }
+                        return@confirmCorner
+                    }
+
                     val hits = frame.hitTest(
                         viewport.width / 2f,
                         viewport.height / 2f
                     )
-                    val lockedPlane = selectedWall
-                    val firstSurfacePose = cornerPoses.firstOrNull()
                     val exactDepthHit = if (
                         depthSupported &&
-                        (
-                            (firstSurfacePose == null && depthReady) ||
-                                (firstSurfacePose != null && selectionUsesDepth)
-                            )
+                        depthReady
                     ) {
                         hits.firstOrNull { result ->
                             result.trackable is DepthPoint &&
-                                poseMatchesMode(result.hitPose, surfaceMode) &&
-                                (
-                                    firstSurfacePose == null ||
-                                        poseBelongsToSurface(result.hitPose, firstSurfacePose)
-                                    )
+                                poseMatchesMode(result.hitPose, surfaceMode)
                         }
                     } else {
                         null
@@ -383,23 +417,11 @@ private fun FaithWallAR() {
                         val plane = result.trackable as? Plane
                         plane != null &&
                             planeMatchesMode(plane, surfaceMode) &&
-                            plane.trackingState == TrackingState.TRACKING &&
-                            when {
-                                firstSurfacePose == null ->
-                                    lockedPlane == null || plane === lockedPlane
-                                selectionUsesDepth ->
-                                    poseBelongsToSurface(result.hitPose, firstSurfacePose)
-                                else ->
-                                    lockedPlane == null || plane === lockedPlane
-                            }
+                            plane.trackingState == TrackingState.TRACKING
                     }
-                    val chosenHit = when {
-                        firstSurfacePose == null -> exactDepthHit ?: exactPlaneHit
-                        selectionUsesDepth -> exactDepthHit ?: exactPlaneHit
-                        else -> exactPlaneHit
-                    }
+                    val chosenHit = exactPlaneHit ?: exactDepthHit
 
-                    if (chosenHit == null && firstSurfacePose == null) {
+                    if (chosenHit == null) {
                         trackingMessage = tr(
                             language,
                             if (depthSupported) {
@@ -413,46 +435,16 @@ private fun FaithWallAR() {
                                 "No ${surfaceModeLabel(surfaceMode, language).lowercase()} detected. Keep scanning slowly"
                             }
                         )
-                    } else if (chosenHit == null) {
-                        trackingMessage = tr(
-                            language,
-                            "当前点与第一个点不在同一平面，请重新瞄准",
-                            "This point is not on the first surface. Aim again"
-                        )
                     } else {
                         val hitPlane = chosenHit.trackable as? Plane
-                        if (cornerPoses.isEmpty()) {
-                            selectionUsesDepth = chosenHit.trackable is DepthPoint
-                            selectedWall = hitPlane
-                        }
+                        selectionUsesDepth = chosenHit.trackable is DepthPoint
+                        selectedWall = hitPlane
                         val cornerOnWall = if (hitPlane != null) {
                             projectPoseToPlane(chosenHit.hitPose, hitPlane)
                         } else {
                             chosenHit.hitPose
                         }
-                        val updatedCorners = cornerPoses + cornerOnWall
-                        cornerPoses = updatedCorners
-
-                        if (updatedCorners.size == 4) {
-                            val centerPose = wallCenterPose(updatedCorners)
-                            val fittedCorners = snapCornersToPlane(updatedCorners, centerPose)
-                            cornerPoses = fittedCorners
-                            val dimensions = measuredDimensions(fittedCorners)
-                            measuredWidth = dimensions.first
-                            measuredHeight = dimensions.second
-                            anchor?.detach()
-                            anchor = latestSession.get()?.createAnchor(centerPose)
-                            locked = true
-                            trackingMessage = tr(
-                                language,
-                                "平面已确认，请输入图片真实宽度",
-                                "Surface confirmed. Enter the real image width"
-                            )
-                            if (bitmap == null) imagePicker.launch("image/*")
-                        } else {
-                            trackingMessage =
-                                cornerInstruction(updatedCorners.size, language, surfaceMode)
-                        }
+                        acceptCorner(cornerOnWall)
                     }
                 }
             },
@@ -933,6 +925,33 @@ private fun poseBelongsToSurface(candidate: Pose, reference: Pose): Boolean {
     )
     val distanceFromPlane = abs(dot(delta, referenceNormal))
     return normalAgreement > 0.80f && distanceFromPlane < 0.15f
+}
+
+private fun centerRayIntersectionWithPlane(
+    cameraPose: Pose,
+    planePose: Pose
+): Pose? {
+    val rayOrigin = floatArrayOf(cameraPose.tx(), cameraPose.ty(), cameraPose.tz())
+    val rayDirection =
+        normalize(cameraPose.rotateVector(floatArrayOf(0f, 0f, -1f)))
+    val planePoint = floatArrayOf(planePose.tx(), planePose.ty(), planePose.tz())
+    val planeNormal =
+        normalize(planePose.rotateVector(floatArrayOf(0f, 1f, 0f)))
+    val denominator = dot(planeNormal, rayDirection)
+    if (abs(denominator) < 0.03f) return null
+    val pointDelta = floatArrayOf(
+        planePoint[0] - rayOrigin[0],
+        planePoint[1] - rayOrigin[1],
+        planePoint[2] - rayOrigin[2]
+    )
+    val distanceAlongRay = dot(pointDelta, planeNormal) / denominator
+    if (distanceAlongRay <= 0f || distanceAlongRay > 30f) return null
+    val intersection = floatArrayOf(
+        rayOrigin[0] + rayDirection[0] * distanceAlongRay,
+        rayOrigin[1] + rayDirection[1] * distanceAlongRay,
+        rayOrigin[2] + rayDirection[2] * distanceAlongRay
+    )
+    return Pose(intersection, planePose.rotationQuaternion)
 }
 
 private fun depthSamplesStable(samples: Collection<Pose>): Boolean {
