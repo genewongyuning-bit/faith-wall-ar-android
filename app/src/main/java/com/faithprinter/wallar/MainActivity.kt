@@ -64,6 +64,7 @@ import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.node.AnchorNode
+import io.github.sceneview.math.Rotation
 import io.github.sceneview.math.Size
 import io.github.sceneview.node.ImageNode
 import io.github.sceneview.rememberEngine
@@ -277,6 +278,11 @@ private fun FaithWallAR() {
                         bitmap = currentBitmap,
                         size = Size(previewWidth, previewHeight),
                         apply = {
+                            // ImageNode is created in its local X-Y plane, while the
+                            // measured surface and its boundary use the anchor's X-Z
+                            // plane. Rotate the image once so both share exactly the
+                            // same plane for walls and floors.
+                            rotation = Rotation(x = -90.0f)
                             isShadowCaster = false
                             isShadowReceiver = false
                         }

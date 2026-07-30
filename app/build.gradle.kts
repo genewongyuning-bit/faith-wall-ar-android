@@ -11,8 +11,8 @@ android {
         applicationId = "com.faithprinter.wallar"
         minSdk = 24
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.9.0"
+        versionCode = 10
+        versionName = "0.10.0"
     }
 
     buildFeatures {
