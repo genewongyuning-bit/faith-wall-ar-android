@@ -64,7 +64,6 @@ import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.node.AnchorNode
-import io.github.sceneview.math.Rotation
 import io.github.sceneview.math.Size
 import io.github.sceneview.node.ImageNode
 import io.github.sceneview.rememberEngine
@@ -278,11 +277,6 @@ private fun FaithWallAR() {
                         bitmap = currentBitmap,
                         size = Size(previewWidth, previewHeight),
                         apply = {
-                            // ImageNode is created in its local X-Y plane, while the
-                            // measured surface and its boundary use the anchor's X-Z
-                            // plane. Rotate the image once so both share exactly the
-                            // same plane for walls and floors.
-                            rotation = Rotation(x = -90.0f)
                             isShadowCaster = false
                             isShadowReceiver = false
                         }
@@ -498,11 +492,17 @@ private fun BrandHeader(modifier: Modifier = Modifier) {
         )
         Text(
             "FAITH  MEASURE AR",
-            modifier = Modifier.padding(horizontal = 9.dp),
+            modifier = Modifier.padding(start = 9.dp, end = 5.dp),
             color = Color.White,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
             letterSpacing = 1.sp
+        )
+        Text(
+            "v${BuildConfig.VERSION_NAME}",
+            color = Blue,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold
         )
     }
 }
@@ -792,20 +792,17 @@ private fun wallCenterPose(corners: List<Pose>): Pose {
             corners[1].tz() - corners[0].tz()
         )
     )
-    val roughZ = normalize(
+    // The four points are confirmed clockwise: top-left, top-right,
+    // bottom-right, bottom-left. Build the anchor directly in the same local
+    // X-Y plane used by ImageNode. Z is the surface normal.
+    val yAxis = normalize(
         floatArrayOf(
-            corners[3].tx() - corners[0].tx(),
-            corners[3].ty() - corners[0].ty(),
-            corners[3].tz() - corners[0].tz()
+            corners[0].tx() - corners[3].tx(),
+            corners[0].ty() - corners[3].ty(),
+            corners[0].tz() - corners[3].tz()
         )
     )
-    var yAxis = normalize(cross(roughZ, xAxis))
-    var zAxis = normalize(cross(xAxis, yAxis))
-    val planeNormal = corners.first().rotateVector(floatArrayOf(0f, 1f, 0f))
-    if (dot(yAxis, planeNormal) < 0f) {
-        yAxis = floatArrayOf(-yAxis[0], -yAxis[1], -yAxis[2])
-        zAxis = floatArrayOf(-zAxis[0], -zAxis[1], -zAxis[2])
-    }
+    val zAxis = normalize(cross(xAxis, yAxis))
     return Pose(translation, quaternionFromAxes(xAxis, yAxis, zAxis))
 }
 
@@ -887,7 +884,7 @@ private fun snapCornersToPlane(corners: List<Pose>, fittedPlanePose: Pose): List
         val local = fittedPlanePose.inverse().transformPoint(
             floatArrayOf(corner.tx(), corner.ty(), corner.tz())
         )
-        local[1] = 0f
+        local[2] = 0f
         val snapped = fittedPlanePose.transformPoint(local)
         Pose(snapped, fittedPlanePose.rotationQuaternion)
     }
@@ -900,10 +897,10 @@ private fun imageBoundaryPoses(
     val halfWidth = widthMeters / 2f
     val halfHeight = heightMeters / 2f
     return listOf(
-        floatArrayOf(-halfWidth, 0f, -halfHeight),
-        floatArrayOf(halfWidth, 0f, -halfHeight),
-        floatArrayOf(halfWidth, 0f, halfHeight),
-        floatArrayOf(-halfWidth, 0f, halfHeight)
+        floatArrayOf(-halfWidth, halfHeight, 0f),
+        floatArrayOf(halfWidth, halfHeight, 0f),
+        floatArrayOf(halfWidth, -halfHeight, 0f),
+        floatArrayOf(-halfWidth, -halfHeight, 0f)
     ).map { localPoint ->
         Pose(
             centerPose.transformPoint(localPoint),
