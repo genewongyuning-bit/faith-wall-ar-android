@@ -69,6 +69,7 @@ import io.github.sceneview.node.ImageNode
 import io.github.sceneview.rememberEngine
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
+import kotlin.math.min
 import kotlin.math.round
 import kotlin.math.sqrt
 
@@ -147,8 +148,16 @@ private fun FaithWallAR() {
         decodeBitmap(context, uri)?.let {
             bitmap?.recycle()
             bitmap = it
+            if (measuredWidth > 0f && measuredHeight > 0f) {
+                widthMeters = fittedImageWidth(it, measuredWidth, measuredHeight)
+                widthInput = format(widthMeters / unitSystem.metersPerUnit)
+            }
             trackingMessage = if (anchor != null) {
-                tr(language, "图片已导入，已按真实尺寸固定", "Image imported at true size")
+                tr(
+                    language,
+                    "图片已等比适配到选定区域内",
+                    "Image fitted inside the selected area"
+                )
             } else {
                 tr(language, "图片已导入，现在可以确认四个角", "Image imported. Confirm four corners")
             }
@@ -165,13 +174,17 @@ private fun FaithWallAR() {
             val dimensions = measuredDimensions(fittedCorners)
             measuredWidth = dimensions.first
             measuredHeight = dimensions.second
+            bitmap?.let {
+                widthMeters = fittedImageWidth(it, measuredWidth, measuredHeight)
+                widthInput = format(widthMeters / unitSystem.metersPerUnit)
+            }
             anchor?.detach()
             anchor = latestSession.get()?.createAnchor(centerPose)
             locked = true
             trackingMessage = tr(
                 language,
-                "平面已确认，请输入图片真实宽度",
-                "Surface confirmed. Enter the real image width"
+                "平面已确认，图片将等比放入选定区域",
+                "Surface confirmed. Image will fit inside the selected area"
             )
             if (bitmap == null) imagePicker.launch("image/*")
         } else {
@@ -374,7 +387,22 @@ private fun FaithWallAR() {
                 val cleaned = sanitizeDecimal(text)
                 widthInput = cleaned
                 cleaned.toFloatOrNull()?.takeIf { it > 0f }?.let { value ->
-                    widthMeters = (value * unitSystem.metersPerUnit).coerceIn(0.05f, 30f)
+                    val requestedWidth =
+                        (value * unitSystem.metersPerUnit).coerceIn(0.05f, 30f)
+                    val maximumWidth = bitmap?.takeIf {
+                        measuredWidth > 0f && measuredHeight > 0f
+                    }?.let {
+                        fittedImageWidth(it, measuredWidth, measuredHeight)
+                    } ?: 30f
+                    widthMeters = min(requestedWidth, maximumWidth)
+                    if (requestedWidth > maximumWidth) {
+                        widthInput = format(widthMeters / unitSystem.metersPerUnit)
+                        trackingMessage = tr(
+                            language,
+                            "已限制为选定区域内可容纳的最大尺寸",
+                            "Limited to the largest size that fits the selected area"
+                        )
+                    }
                 }
             },
             onConfirmCorner = confirmCorner@{
@@ -1014,6 +1042,17 @@ private fun measuredDimensions(corners: List<Pose>): Pair<Float, Float> {
     val bottom = poseDistance(corners[3], corners[2])
     val left = poseDistance(corners[0], corners[3])
     return Pair((top + bottom) / 2f, (left + right) / 2f)
+}
+
+private fun fittedImageWidth(
+    bitmap: Bitmap,
+    areaWidth: Float,
+    areaHeight: Float
+): Float {
+    if (bitmap.width <= 0 || bitmap.height <= 0) return areaWidth
+    val imageAspect = bitmap.width / bitmap.height.toFloat()
+    val widthLimitedByHeight = areaHeight * imageAspect
+    return min(areaWidth, widthLimitedByHeight).coerceAtLeast(0.05f)
 }
 
 private fun poseDistance(a: Pose, b: Pose): Float {
