@@ -248,13 +248,12 @@ private fun FaithWallAR() {
                 if (stableNow != depthReady) depthReady = stableNow
                 val currentBitmap = bitmap
                 val currentAnchor = anchor
-                val boundaryPoses = if (currentBitmap != null && currentAnchor != null) {
-                    val imageHeight =
-                        widthMeters * currentBitmap.height / currentBitmap.width.toFloat()
-                    imageBoundaryPoses(currentAnchor.pose, widthMeters, imageHeight)
-                } else {
-                    cornerPoses
-                }
+                // The four-point outline is only a placement aid. Once an image
+                // is placed, hide it so the app presents a clean visual preview
+                // instead of implying measurement-grade accuracy.
+                val boundaryPoses =
+                    if (currentBitmap != null && currentAnchor != null) emptyList()
+                    else cornerPoses
                 overlayPoints = boundaryPoses.mapNotNull {
                     projectPoseToScreen(it, frame, viewport)
                 }
@@ -615,7 +614,13 @@ private fun Controls(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
-            text = if (measuredWidth > 0f) {
+            text = if (bitmap != null && placed) {
+                tr(
+                    language,
+                    "效果预览 · 尺寸仅供参考",
+                    "Visual preview · Size for reference only"
+                )
+            } else if (measuredWidth > 0f) {
                 tr(language, "已确认区域 ", "Selected area ") +
                     "${format(measuredWidthDisplay)} × ${format(measuredHeightDisplay)} $displayUnit"
             } else {
@@ -667,7 +672,7 @@ private fun Controls(
                     onValueChange = onWidthInputChange,
                     modifier = Modifier.size(width = 152.dp, height = 58.dp),
                     label = {
-                        Text(tr(language, "真实宽度", "Print width"), fontSize = 11.sp)
+                        Text(tr(language, "预览宽度", "Preview width"), fontSize = 11.sp)
                     },
                     suffix = { Text(displayUnit) },
                     singleLine = true
@@ -685,7 +690,11 @@ private fun Controls(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        tr(language, "比例锁定 · 不拉伸", "Aspect locked · No stretch"),
+                        tr(
+                            language,
+                            "比例锁定 · 仅作效果参考",
+                            "Aspect locked · Visual reference"
+                        ),
                         color = Blue,
                         fontSize = 10.sp
                     )
@@ -916,26 +925,6 @@ private fun snapCornersToPlane(corners: List<Pose>, fittedPlanePose: Pose): List
         val snapped = fittedPlanePose.transformPoint(local)
         Pose(snapped, fittedPlanePose.rotationQuaternion)
     }
-
-private fun imageBoundaryPoses(
-    centerPose: Pose,
-    widthMeters: Float,
-    heightMeters: Float
-): List<Pose> {
-    val halfWidth = widthMeters / 2f
-    val halfHeight = heightMeters / 2f
-    return listOf(
-        floatArrayOf(-halfWidth, halfHeight, 0f),
-        floatArrayOf(halfWidth, halfHeight, 0f),
-        floatArrayOf(halfWidth, -halfHeight, 0f),
-        floatArrayOf(-halfWidth, -halfHeight, 0f)
-    ).map { localPoint ->
-        Pose(
-            centerPose.transformPoint(localPoint),
-            centerPose.rotationQuaternion
-        )
-    }
-}
 
 private fun poseMatchesMode(pose: Pose, mode: SurfaceMode): Boolean {
     val normal = normalize(pose.rotateVector(floatArrayOf(0f, 1f, 0f)))
